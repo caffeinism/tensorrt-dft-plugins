@@ -39,5 +39,6 @@ add_library(${TARGET_NAME} SHARED ${PROJECT_SOURCES})
 
 target_link_libraries(${PROJECT_NAME}
                       CUDA::cufft
+                      CUDA::cublas
                       nvinfer
                       )
