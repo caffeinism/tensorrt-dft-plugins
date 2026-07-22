@@ -28,6 +28,7 @@
 #include <cufftXt.h>
 #include <cublas_v2.h>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstring>
@@ -143,14 +144,6 @@ class RfftPluginBase: public IPluginV2DynamicExt {
         in_desc_ = in0;
         out_desc_ = out0;
 
-        // TODO(akamenev): max/min dims are not yet supported, so check that.
-        assert(in0.desc.dims.nbDims == in0.min.nbDims);
-        assert(in0.desc.dims.nbDims == in0.max.nbDims);
-        auto in0_dims_b = std::begin(in0.desc.dims.d);
-        auto in0_dims_e = in0_dims_b + in0.desc.dims.nbDims;
-        assert(std::equal(in0_dims_b, in0_dims_e, std::begin(in0.min.d)));
-        assert(std::equal(in0_dims_b, in0_dims_e, std::begin(in0.max.d)));
-
         // TODO(akamenev): according to TRT docs:
         // https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#ipluginv2
         // configurePlugin should not be used to allocate resources, however,
@@ -158,29 +151,21 @@ class RfftPluginBase: public IPluginV2DynamicExt {
         // and this information is not yet available in initialize() which is called
         // before configurePlugin.
 
-        handle_ = cufft_ptr(createCufftHandle());
-
-        // Disable cuFFT workspace auto-allocation as we'll be using
-        // TensorRT-allocated workspace.
-        auto err = cufftSetAutoAllocation(*handle_, 0);
-        assert(err == CUFFT_SUCCESS);
-
-        // Create cuFFT plan.
-        auto [batch_size, dft_dims] = splitSignalDims();
-        auto in_out_types = getInOutTypes();
-        err = cufftXtMakePlanMany(*handle_, signal_ndim_, dft_dims.data(),
-                                  /*inembed*/nullptr, 1, 0, std::get<0>(in_out_types),
-                                  /*onembed*/nullptr, 1, 0, std::get<1>(in_out_types),
-                                  /*batch*/batch_size,
-                                  /*workSize*/ws_size_.data(),
-                                  /*executiontype*/CUDA_C_32F);
-        assert(err == CUFFT_SUCCESS);
+        // Create the plan with the profile max dims so the TRT-allocated
+        // workspace is large enough for any runtime batch size. If runtime
+        // dims differ (dynamic batch), enqueue() re-plans with actual dims.
+        makePlan(signalIsInput() ? in0.max : out0.max);
     }
 
     int32_t enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
                     void const* const* inputs, void* const* outputs,
                     void* workspace, cudaStream_t stream) noexcept override {
         static_assert(Direction == CUFFT_FORWARD || Direction == CUFFT_INVERSE);
+
+        // Dynamic batch: re-plan if runtime dims differ from the current plan.
+        auto dims = signalIsInput() ? inputDesc[0].dims : outputDesc[0].dims;
+        if (!dimsEqual(dims, plan_dims_))
+            makePlan(dims);
 
         auto err = cufftSetStream(*handle_, stream);
         assert(err == CUFFT_SUCCESS);
@@ -244,12 +229,41 @@ class RfftPluginBase: public IPluginV2DynamicExt {
 
     virtual std::pair<cudaDataType, cudaDataType> getInOutTypes() const noexcept = 0;
 
-    virtual Dims getSignalDims() const noexcept = 0;
+    // Which tensor carries the real signal dims: input for RFFT, output for IRFFT.
+    virtual bool signalIsInput() const noexcept = 0;
+
+    static bool dimsEqual(Dims const& a, Dims const& b) {
+        return a.nbDims == b.nbDims && std::equal(a.d, a.d + a.nbDims, b.d);
+    }
+
+    // (Re)creates the cuFFT plan for the given signal dims.
+    void makePlan(Dims dims) {
+        handle_ = cufft_ptr(createCufftHandle());
+
+        // Disable cuFFT workspace auto-allocation as we'll be using
+        // TensorRT-allocated workspace.
+        auto err = cufftSetAutoAllocation(*handle_, 0);
+        assert(err == CUFFT_SUCCESS);
+
+        auto [batch_size, dft_dims] = splitSignalDims(dims);
+        auto in_out_types = getInOutTypes();
+        size_t ws_size{0};
+        err = cufftXtMakePlanMany(*handle_, signal_ndim_, dft_dims.data(),
+                                  /*inembed*/nullptr, 1, 0, std::get<0>(in_out_types),
+                                  /*onembed*/nullptr, 1, 0, std::get<1>(in_out_types),
+                                  /*batch*/batch_size,
+                                  /*workSize*/&ws_size,
+                                  /*executiontype*/CUDA_C_32F);
+        assert(err == CUFFT_SUCCESS);
+
+        plan_dims_ = dims;
+        // Keep the max seen (configurePlugin plans with profile max dims,
+        // so re-plans for smaller runtime batches never need more).
+        ws_size_[0] = std::max(ws_size_[0], ws_size);
+    }
 
     // Splits total signal dims into batch size and DFT signal dims.
-    std::pair<int32_t, std::array<long long, 3>> splitSignalDims() {
-        auto dims = getSignalDims();
-
+    std::pair<int32_t, std::array<long long, 3>> splitSignalDims(Dims dims) {
         assert(dims.nbDims >= signal_ndim_);
 
         // cuFFT supports only 1D, 2D and 3D DFTs.
@@ -336,6 +350,8 @@ class RfftPluginBase: public IPluginV2DynamicExt {
 
     // cuFFT data.
     cufft_ptr handle_;
+    // Signal dims the current plan was created for.
+    Dims plan_dims_{};
 
     // cuFFT workspace size.
     // TODO(akamenev): assuming single GPU for now.
@@ -393,7 +409,7 @@ class RfftPlugin: public RfftPluginBase<CUFFT_FORWARD> {
         return {CUDA_R_32F, CUDA_C_32F};
     }
 
-    Dims getSignalDims() const noexcept override { return in_desc_.desc.dims; }
+    bool signalIsInput() const noexcept override { return true; }
 };
 
 
@@ -456,7 +472,7 @@ class IrfftPlugin: public RfftPluginBase<CUFFT_INVERSE> {
 
         // Scale the output to mimic ONNX Contrib IRFFT behavior
         // aka "backward" normalization mode in PyTorch fft.
-        auto [batch_size, dft_dims] = splitSignalDims();
+        auto [batch_size, dft_dims] = splitSignalDims(outputDesc[0].dims);
         float total_dft_size = 1.0f;
         for (int i = 0; i < signal_ndim_; i++)
             total_dft_size *= dft_dims[i];
@@ -485,7 +501,7 @@ class IrfftPlugin: public RfftPluginBase<CUFFT_INVERSE> {
         return {CUDA_C_32F, CUDA_R_32F};
     }
 
-    Dims getSignalDims() const noexcept override { return out_desc_.desc.dims; }
+    bool signalIsInput() const noexcept override { return false; }
 
  private:
     cublas_ptr cublas_;

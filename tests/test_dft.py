@@ -151,6 +151,56 @@ def test_rfft2(trt_logger, dft_dim1, dft_dim2, num_c, batch_size):
     assert torch.allclose(y_expected, y)
 
 
+@pytest.mark.parametrize("model_cls", [OnnxRfft2, OnnxIrfft2])
+def test_dynamic_batch(trt_logger, model_cls):
+    class Model(nn.Module):
+        def forward(self, x):
+            return model_cls.apply(x)
+
+    torch.manual_seed(1)
+    x = torch.randn(2, 3, 2, 4)
+    if model_cls is OnnxIrfft2:
+        x = OnnxRfft2.apply(x)
+
+    with io.BytesIO() as f:
+        torch.onnx.export(
+            Model(),
+            x,
+            f,
+            operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
+            opset_version=15,
+            input_names=["x"],
+            dynamic_axes={"x": {0: "batch"}},
+        )
+        onnx_model = f.getvalue()
+
+    builder = trt.Builder(trt_logger)
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    )
+    parser = trt.OnnxParser(network, trt_logger)
+    assert parser.parse(onnx_model)
+
+    config = builder.create_builder_config()
+    profile = builder.create_optimization_profile()
+    shape = tuple(x.shape[1:])
+    profile.set_shape("x", (1, *shape), (2, *shape), (4, *shape))
+    config.add_optimization_profile(profile)
+    trt_plan = builder.build_serialized_network(network, config)
+
+    runtime = trt.Runtime(trt_logger)
+    engine = runtime.deserialize_cuda_engine(trt_plan)
+    context = engine.create_execution_context()
+    for batch_size in (1, 3, 4):
+        xb = torch.randn(batch_size, *shape)
+        y_expected = model_cls.apply(xb)
+        xb_gpu = xb.cuda()
+        y = torch.empty_like(y_expected).cuda()
+        context.set_binding_shape(0, tuple(xb.shape))
+        context.execute_v2([xb_gpu.data_ptr(), y.data_ptr()])
+        assert torch.allclose(y_expected, y.cpu())
+
+
 @pytest.mark.parametrize("dft_dim1", [1, 2])
 @pytest.mark.parametrize("dft_dim2", [4])
 @pytest.mark.parametrize("num_c", [1, 3])
