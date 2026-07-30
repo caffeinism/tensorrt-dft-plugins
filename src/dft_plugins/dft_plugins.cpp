@@ -711,7 +711,16 @@ class DftPlugin: public IPluginV2DynamicExt {
     }
 
  public:
-    static constexpr char name[]{"DFT"};
+    // NOT "DFT": TensorRT 11 ships its own DFT importer, and the parser reaches
+    // for the builtin by op_type before ever consulting the plugin registry --
+    // regardless of the node's domain. Its checker then rejects every form of the
+    // op (measured: all 13 shape/attribute/opset combinations fail to parse), and
+    // a rejected builtin does not fall back to a plugin. The only way in besides
+    // trtexec --enablePluginOverride (global, and it also diverts ops TRT bundles
+    // legacy plugins for -- ScatterND then fails to build) is an op_type that has
+    // no builtin importer. Producers emit standard onnx::DFT and rename to this
+    // as the last step, so onnxruntime/modelopt still see a standard graph.
+    static constexpr char name[]{"DFTPlugin"};
 
  protected:
     // (Re)creates the cuFFT plan from the INPUT dims: the signal length lives on

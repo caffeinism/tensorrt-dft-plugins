@@ -81,7 +81,12 @@ class OnnxDft(Function):
     def symbolic(
         g: torch.Graph, input: torch.Value, inverse: int, onesided: int
     ) -> torch.Value:
-        return g.op("DFT", input, inverse_i=inverse, onesided_i=onesided)
+        # DFTPlugin, not DFT: TRT's builtin DFT importer would shadow the plugin
+        # (and rejects every form of the op). Producers export standard onnx::DFT
+        # and rename as a final step; this mirrors the renamed result.
+        return g.op(
+            "trt.plugins::DFTPlugin", input, inverse_i=inverse, onesided_i=onesided
+        )
 
 
 def dft_rfft2(x: Tensor) -> Tensor:
@@ -165,7 +170,7 @@ def test_plugins_load():
     loaded_plugins = {p.name for p in trt.get_plugin_registry().plugin_creator_list}
     assert "Rfft" in loaded_plugins
     assert "Irfft" in loaded_plugins
-    assert "DFT" in loaded_plugins
+    assert "DFTPlugin" in loaded_plugins
 
 
 # (inverse, onesided): RFFT, forward C2C, inverse C2C. onesided+inverse is not
