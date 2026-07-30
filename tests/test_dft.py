@@ -60,6 +60,54 @@ class OnnxIrfft2(Function):
         )
 
 
+class OnnxDft(Function):
+    """Standard onnx::DFT (opset >= 20) over the second-to-last axis.
+
+    The last dim carries the real/imag pair (1 = real, 2 = complex), which makes
+    the transform axis -2 -- DFT's default -- so no axis/dft_length inputs are
+    needed and the node is a single-input node with two int attributes.
+    """
+
+    @staticmethod
+    def forward(ctx, input: Tensor, inverse: int, onesided: int) -> Tensor:
+        if not inverse and onesided:  # RFFT
+            return torch.view_as_real(torch.fft.rfft(input[..., 0], dim=-1))
+        z = torch.view_as_complex(input.contiguous())
+        if not inverse:  # forward C2C
+            return torch.view_as_real(torch.fft.fft(z, dim=-1))
+        return torch.view_as_real(torch.fft.ifft(z, dim=-1))  # inverse C2C, 1/n
+
+    @staticmethod
+    def symbolic(
+        g: torch.Graph, input: torch.Value, inverse: int, onesided: int
+    ) -> torch.Value:
+        # DFTPlugin, not DFT: TRT's builtin DFT importer would shadow the plugin
+        # (and rejects every form of the op). Producers export standard onnx::DFT
+        # and rename as a final step; this mirrors the renamed result.
+        return g.op(
+            "trt.plugins::DFTPlugin", input, inverse_i=inverse, onesided_i=onesided
+        )
+
+
+def dft_rfft2(x: Tensor) -> Tensor:
+    """(..., H, W) real -> (..., H, W//2+1, 2), as two standard DFT nodes."""
+    t = OnnxDft.apply(x.unsqueeze(-1), 0, 1)
+    t = OnnxDft.apply(t.transpose(-3, -2), 0, 0)
+    return t.transpose(-3, -2)
+
+
+def dft_irfft2(t: Tensor) -> Tensor:
+    """(..., H, W//2+1, 2) -> (..., H, W) real.
+
+    onesided+inverse is avoided on purpose (onnxruntime rejects it), so the
+    Hermitian half is mirrored with standard ops before a full complex inverse.
+    """
+    t = OnnxDft.apply(t.transpose(-3, -2), 1, 0)
+    t = t.transpose(-3, -2)
+    mid = t[..., 1:-1, :].flip(-2) * torch.tensor([1.0, -1.0])
+    return OnnxDft.apply(torch.cat([t, mid], dim=-2), 1, 0)[..., 0]
+
+
 @pytest.fixture(scope="session", autouse=True)
 def load_trt_plugins():
     load_plugins()
@@ -71,7 +119,10 @@ def trt_logger():
 
 
 def export_to_onnx(
-    model: nn.Module, inp: Tensor, verbose: Optional[bool] = True
+    model: nn.Module,
+    inp: Tensor,
+    verbose: Optional[bool] = True,
+    opset_version: int = 15,
 ) -> bytes:
     with io.BytesIO() as onnx_model:
         # Export to ONNX.
@@ -80,7 +131,7 @@ def export_to_onnx(
             inp,
             onnx_model,
             operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
-            opset_version=15,
+            opset_version=opset_version,
             verbose=verbose,
         )
         return onnx_model.getvalue()
@@ -119,6 +170,55 @@ def test_plugins_load():
     loaded_plugins = {p.name for p in trt.get_plugin_registry().plugin_creator_list}
     assert "Rfft" in loaded_plugins
     assert "Irfft" in loaded_plugins
+    assert "DFTPlugin" in loaded_plugins
+
+
+# (inverse, onesided): RFFT, forward C2C, inverse C2C. onesided+inverse is not
+# supported -- see dft_irfft2.
+@pytest.mark.parametrize("inverse,onesided", [(0, 1), (0, 0), (1, 0)])
+@pytest.mark.parametrize("n", [4, 8])
+@pytest.mark.parametrize("batch_dims", [(1, 3), (2, 1)])
+def test_dft(trt_logger, inverse, onesided, n, batch_dims):
+    class DftModel(nn.Module):
+        def forward(self, x):
+            return OnnxDft.apply(x, inverse, onesided)
+
+    torch.manual_seed(1)
+    # real input (trailing 1) for RFFT, complex (trailing 2) otherwise
+    x = torch.randn(*batch_dims, n, 1 if onesided else 2)
+
+    onnx_model = export_to_onnx(DftModel(), x, opset_version=20)
+    trt_plan = build_trt_plan(onnx_model, trt_logger)
+
+    y_expected = OnnxDft.apply(x, inverse, onesided)
+    y = run_trt_inference(trt_plan, x, torch.empty_like(y_expected), trt_logger)
+
+    assert torch.allclose(y_expected, y, atol=1e-5)
+
+
+@pytest.mark.parametrize("h,w", [(4, 8), (8, 8)])
+def test_dft_rfft2_roundtrip(trt_logger, h, w):
+    """The shape the exporter actually emits: rfft2 -> irfft2 must reconstruct."""
+
+    class Roundtrip(nn.Module):
+        def forward(self, x):
+            return dft_irfft2(dft_rfft2(x))
+
+    torch.manual_seed(1)
+    x = torch.randn(2, 3, h, w)
+
+    onnx_model = export_to_onnx(Roundtrip(), x, opset_version=20)
+    trt_plan = build_trt_plan(onnx_model, trt_logger)
+
+    y = run_trt_inference(trt_plan, x, torch.empty_like(x), trt_logger)
+
+    assert torch.allclose(x, y, atol=1e-4)
+    # ... and match torch.fft, which is what the model computed before the
+    # switch to standard DFT nodes.
+    want = torch.fft.irfft2(
+        torch.fft.rfft2(x, dim=(-2, -1), norm="backward"), dim=(-2, -1), norm="backward"
+    )
+    assert torch.allclose(want, y, atol=1e-4)
 
 
 @pytest.mark.parametrize("dft_dim1", [1, 2])
